@@ -1,0 +1,279 @@
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(TEMR)
+})
+
+# ============================================================
+# Reverse TEMR analysis: VTE -> MDD
+# ============================================================
+
+# -----------------------------
+# 1. Input files and parameters
+# -----------------------------
+exposure_files <- list(
+  EUR = "41_VTE_EUR.csv",
+  EAS = "GCST90399743.txt",
+  AFR = "GCST90476006.tsv",
+  HIS = "GCST90476005.tsv",
+  SAS = "20250523_SAS_VTE.csv"
+)
+
+outcome_files <- list(
+  EUR = "pgc-mdd2025_no23andMe_eur.tsv",
+  EAS = "MDD_EAS_Neff.csv",
+  AFR = "MDD_AFR_Neff.csv",
+  HIS = "MDD_HIS_Neff.csv",
+  SAS = "MDD_SAS_Neff.csv"
+)
+
+ancestries <- c("EAS", "AFR", "HIS", "SAS")
+auxiliary_population <- "EUR"
+
+# Kept here for record, although the current implementation uses rho = NULL
+rg_values <- c(
+  EAS = 0.530,
+  AFR = 0.684,
+  HIS = 0.550,
+  SAS = 0.650
+)
+
+optimizers <- c("BFGS", "Nelder-Mead", "CG", "L-BFGS-B", "SANN")
+min_se <- 1e-4
+
+# -----------------------------
+# 2. Helper functions
+# -----------------------------
+read_effect_data <- function(file, snps = NULL, beta_name = "beta", se_name = "se",
+                             out_beta = "beta_ex", out_se = "se_ex",
+                             sep = ",") {
+  dat <- fread(file, sep = sep, select = c("SNP", beta_name, se_name)) |>
+    as.data.frame()
+
+  if (!is.null(snps)) {
+    dat <- dat[dat$SNP %in% snps, , drop = FALSE]
+  }
+
+  dat |>
+    transmute(
+      SNP = SNP,
+      !!out_beta := .data[[beta_name]],
+      !!out_se   := .data[[se_name]]
+    )
+}
+
+filter_positive_se <- function(dat, se_col) {
+  dat[dat[[se_col]] > 0, , drop = FALSE]
+}
+
+align_to_snp_order <- function(dat, snp_order) {
+  dat[match(snp_order, dat$SNP), , drop = FALSE]
+}
+
+build_matrix <- function(data_list, value_col, ordered_names) {
+  do.call(
+    cbind,
+    lapply(ordered_names, function(nm) data_list[[nm]][[value_col]])
+  )
+}
+
+run_temr_safe <- function(bxg, byg, sxg, syg, method_name, target_pop) {
+  tryCatch(
+    TEMR(bxg, byg, sxg, syg, rho = NULL, meth = method_name),
+    error = function(e) {
+      message("  ", target_pop, ": TEMR fitting failed under rho = NULL; retrying once")
+      TEMR(bxg, byg, sxg, syg, rho = NULL, meth = method_name)
+    }
+  )
+}
+
+extract_core_result <- function(res, pop) {
+  data.frame(
+    population = pop,
+    beta = res$resultall[[pop]]$beta,
+    stat = res$resultall[[pop]]$stat,
+    pval = res$resultall[[pop]]$pvalue
+  )
+}
+
+extract_method_result <- function(res, pop) {
+  rbind(
+    data.frame(population = pop, method = "IVW",   t(res$betaXY_IVW[pop, ])),
+    data.frame(population = pop, method = "Egger", t(res$betaXY_Egger[pop, ])),
+    data.frame(population = pop, method = "Final", t(res$betaXY_Final[pop, ]))
+  )
+}
+
+# -----------------------------
+# 3. Load EUR instrumental SNPs
+# -----------------------------
+eur_iv <- fread(exposure_files$EUR, sep = ",") |> as.data.frame()
+iv_snps <- eur_iv$SNP
+
+cat("Number of EUR IVs:", length(iv_snps), "\n")
+
+exposure_data <- list()
+exposure_data$EUR <- eur_iv |>
+  transmute(SNP = SNP, beta_ex = beta, se_ex = se)
+
+# -----------------------------
+# 4. Load non-EUR exposure data
+# -----------------------------
+for (pop in ancestries) {
+  exposure_data[[pop]] <- read_effect_data(
+    file = exposure_files[[pop]],
+    snps = iv_snps,
+    out_beta = "beta_ex",
+    out_se = "se_ex",
+    sep = ","
+  )
+}
+
+# -----------------------------
+# 5. Load outcome data
+# -----------------------------
+outcome_data <- list()
+for (pop in c("EUR", ancestries)) {
+  outcome_data[[pop]] <- read_effect_data(
+    file = outcome_files[[pop]],
+    snps = iv_snps,
+    out_beta = "beta_out",
+    out_se = "se_out",
+    sep = ","
+  )
+}
+
+# -----------------------------
+# 6. Basic QC: keep rows with SE > 0
+# -----------------------------
+for (pop in names(exposure_data)) {
+  exposure_data[[pop]] <- filter_positive_se(exposure_data[[pop]], "se_ex")
+}
+for (pop in names(outcome_data)) {
+  outcome_data[[pop]] <- filter_positive_se(outcome_data[[pop]], "se_out")
+}
+
+# -----------------------------
+# 7. Intersect SNPs across all datasets
+# -----------------------------
+common_snps <- Reduce(
+  intersect,
+  c(
+    lapply(exposure_data, function(x) x$SNP),
+    lapply(outcome_data, function(x) x$SNP)
+  )
+)
+
+stopifnot(length(common_snps) >= 3)
+
+for (pop in names(exposure_data)) {
+  exposure_data[[pop]] <- align_to_snp_order(exposure_data[[pop]], common_snps)
+}
+for (pop in names(outcome_data)) {
+  outcome_data[[pop]] <- align_to_snp_order(outcome_data[[pop]], common_snps)
+}
+
+# -----------------------------
+# 8. Build beta/SE matrices
+# -----------------------------
+matrix_order <- c(ancestries, auxiliary_population)
+
+betaXG <- build_matrix(exposure_data, "beta_ex", matrix_order)
+betaYG <- build_matrix(outcome_data, "beta_out", matrix_order)
+sebetaXG <- build_matrix(exposure_data, "se_ex", matrix_order)
+sebetaYG <- build_matrix(outcome_data, "se_out", matrix_order)
+
+colnames(betaXG) <- c(ancestries, "auxiliary")
+colnames(betaYG) <- c(ancestries, "auxiliary")
+colnames(sebetaXG) <- c(ancestries, "auxiliary")
+colnames(sebetaYG) <- c(ancestries, "auxiliary")
+
+rownames(betaXG) <- common_snps
+rownames(betaYG) <- common_snps
+rownames(sebetaXG) <- common_snps
+rownames(sebetaYG) <- common_snps
+
+# -----------------------------
+# 9. Additional QC
+#    - floor very small SE values
+#    - remove SNPs with any betaXG == 0
+# -----------------------------
+sebetaXG[sebetaXG < min_se] <- min_se
+sebetaYG[sebetaYG < min_se] <- min_se
+
+zero_beta_flag <- apply(betaXG == 0, 1, any)
+
+if (any(zero_beta_flag)) {
+  cat("Removed SNPs with betaXG == 0:", sum(zero_beta_flag), "\n")
+  betaXG   <- betaXG[!zero_beta_flag, , drop = FALSE]
+  betaYG   <- betaYG[!zero_beta_flag, , drop = FALSE]
+  sebetaXG <- sebetaXG[!zero_beta_flag, , drop = FALSE]
+  sebetaYG <- sebetaYG[!zero_beta_flag, , drop = FALSE]
+}
+
+cat("Number of SNPs included in TEMR:", nrow(betaXG), "\n")
+stopifnot(nrow(betaXG) >= 3)
+
+# -----------------------------
+# 10. Export TEMR exposure-side input table
+# -----------------------------
+temr_input_table <- data.frame(
+  SNP      = rownames(betaXG),
+  beta_EAS = betaXG[, "EAS"], se_EAS = sebetaXG[, "EAS"],
+  beta_AFR = betaXG[, "AFR"], se_AFR = sebetaXG[, "AFR"],
+  beta_HIS = betaXG[, "HIS"], se_HIS = sebetaXG[, "HIS"],
+  beta_SAS = betaXG[, "SAS"], se_SAS = sebetaXG[, "SAS"],
+  beta_EUR = betaXG[, "auxiliary"], se_EUR = sebetaXG[, "auxiliary"]
+)
+
+write.csv(
+  temr_input_table,
+  file = "TEMR_input_SNPs_beta_SE.csv",
+  row.names = FALSE
+)
+
+# -----------------------------
+# 11. Run pairwise TEMR across optimizers
+# -----------------------------
+for (opt_method in optimizers) {
+  message(">>> Optimizer: ", opt_method)
+  dir.create(opt_method, showWarnings = FALSE)
+
+  core_results <- list()
+  method_results <- list()
+
+  for (target_pop in names(rg_values)) {
+    bxg <- betaXG[, c(target_pop, "auxiliary"), drop = FALSE]
+    byg <- betaYG[, c(target_pop, "auxiliary"), drop = FALSE]
+    sxg <- sebetaXG[, c(target_pop, "auxiliary"), drop = FALSE]
+    syg <- sebetaYG[, c(target_pop, "auxiliary"), drop = FALSE]
+
+    fit <- run_temr_safe(
+      bxg = bxg,
+      byg = byg,
+      sxg = sxg,
+      syg = syg,
+      method_name = opt_method,
+      target_pop = target_pop
+    )
+
+    core_results[[target_pop]] <- extract_core_result(fit, target_pop)
+    method_results[[target_pop]] <- extract_method_result(fit, target_pop)
+  }
+
+  write.csv(
+    do.call(rbind, core_results),
+    file.path(opt_method, "TEMR_pairwise.csv"),
+    row.names = FALSE
+  )
+
+  write.csv(
+    do.call(rbind, method_results),
+    file.path(opt_method, "MRmethods_pairwise.csv"),
+    row.names = FALSE
+  )
+
+  print(do.call(rbind, core_results))
+}
+
+message("All optimizers completed. Results have been written to their corresponding folders.")
